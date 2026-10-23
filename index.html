@@ -59,6 +59,7 @@ button:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
 canvas{grid-column:1/-1;width:100%;height:56px;display:block}
 .msg{grid-column:1/-1;color:var(--bad);font-weight:600;font-size:14px}
 .msg:empty{display:none}
+.tip{grid-column:1/-1;color:var(--warn);font-weight:600;font-size:13px}
 @media (max-width:420px){.speed{font-size:68px}.stats{grid-template-columns:repeat(2,1fr)}}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
@@ -93,6 +94,7 @@ canvas{grid-column:1/-1;width:100%;height:56px;display:block}
   </div>
   <canvas id="chart" aria-label="Velocidad de los últimos 10 minutos"></canvas>
   <div class="msg" id="msg"></div>
+  <div class="tip" id="tip" hidden>La ubicación llega aproximada (red móvil). En Android: Ajustes → Apps → Chrome → Permisos → Ubicación → activá «Usar ubicación precisa». Si ya está, es el vagón: acercá el teléfono a la ventana.</div>
 </section>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
@@ -126,7 +128,7 @@ function hav(a,b){const dLa=(b.la-a.la)*DEG,dLo=(b.lo-a.lo)*DEG;
 
 // --- Vías cercanas (OpenStreetMap vía Overpass): solo líneas principales, sin playas ni desvíos
 const OVERPASS = ['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter','https://maps.mail.ru/osm/tools/overpass/api/interpreter'];
-const FETCH_RADIUS = 20000, REFETCH_AFTER = 10000;
+const FETCH_RADIUS = 12000, REFETCH_AFTER = 6000;
 const rails = new Map();     // id -> {id,name,ll,xy,cum,len,bb}
 const stations = new Map();  // id -> {name,la,lo}
 let railArea = store.get('railArea', null), railFetching = false, railFailAt = 0, railError = '';
@@ -148,11 +150,20 @@ function addRailData(ways, nodes){
 }
 function saveRails(){
   // la caché guarda lo más cercano: si el navegador no deja tanto, se recorta
-  const ways=[...rails.values()].map(w=>({id:w.id,name:w.name,ll:w.ll})), nodes=[...stations.values()];
+  const ways=[...rails.values()].filter(w=>!ptIds.has(w.id)).map(w=>({id:w.id,name:w.name,ll:w.ll})), nodes=[...stations.values()];
   for(const n of [ways.length, 1500, 600]){
     try{ localStorage.setItem('tren:rails', JSON.stringify({ways:ways.slice(-n),nodes})); return }catch{}
   }
 }
+// Vías de Portugal precargadas junto a la página (las baja una Action de GitHub): no dependen de Overpass
+const PT_BOX=[36.8,-9.7,42.3,-6.0], ptIds=new Set(); let ptLoaded=false;
+const inPT=(la,lo)=>la>PT_BOX[0]&&la<PT_BOX[2]&&lo>PT_BOX[1]&&lo<PT_BOX[3];
+fetch('vias-pt.json').then(r=>r.ok?r.json():null).then(j=>{
+  if(!j) return;
+  const ways=j.ways.map(([id,name,f])=>{const ll=[];for(let i=0;i<f.length;i+=2)ll.push([f[i],f[i+1]]);ptIds.add(id);return {id,name,ll}});
+  addRailData(ways, j.nodes.map(([id,name,la,lo])=>({id,name,la,lo})));
+  ptLoaded=true; renderRailStatus();
+}).catch(()=>{});
 (function loadRails(){ const c=store.get('rails',null); if(c) addRailData(c.ways||[], c.nodes||[]) })();
 
 async function fetchRails(la,lo){
@@ -162,8 +173,8 @@ async function fetchRails(la,lo){
             `node["railway"~"^(station|halt)$"](around:${FETCH_RADIUS+10000},${la},${lo});out tags;`;
   for(const url of OVERPASS){
     try{
-      const ctl = new AbortController(); const to = setTimeout(()=>ctl.abort(), 35000);
-      const r = await fetch(url,{method:'POST',body:'data='+encodeURIComponent(q),headers:{'Content-Type':'application/x-www-form-urlencoded'},signal:ctl.signal});
+      const ctl = new AbortController(); const to = setTimeout(()=>ctl.abort(), 25000);
+      const r = await fetch(url+'?data='+encodeURIComponent(q),{signal:ctl.signal});
       clearTimeout(to);
       if(!r.ok) throw new Error('HTTP '+r.status);
       const j = await r.json();
@@ -173,16 +184,17 @@ async function fetchRails(la,lo){
         else if(e.type==='node' && e.tags && e.tags.name) nodes.push({id:e.id, name:e.tags.name, la:e.lat, lo:e.lon});
       }
       // se descartan los tramos lejanos para que la memoria no crezca sin fin
-      for(const w of rails.values()){ const m=w.ll[Math.floor(w.ll.length/2)]; if(hav({la:m[0],lo:m[1]},{la,lo})>60000) rails.delete(w.id) }
+      for(const w of rails.values()){ if(ptIds.has(w.id)) continue; const m=w.ll[Math.floor(w.ll.length/2)]; if(hav({la:m[0],lo:m[1]},{la,lo})>60000) rails.delete(w.id) }
       for(const s of stations.values()){ if(hav(s,{la,lo})>80000) stations.delete(s.id) }
       addRailData(ways,nodes);
       railArea = {la,lo,t:Date.now()}; store.set('railArea',railArea); saveRails();
       railFetching=false; railError=''; renderRailStatus(); return;
-    }catch(e){ railError = e.name==='AbortError' ? 'tiempo agotado' : 'sin conexión'; }
+    }catch(e){ railError = e.name==='AbortError' ? 'tiempo agotado' : /^HTTP/.test(e.message) ? 'servidor ocupado ('+e.message+')' : 'sin conexión'; }
   }
   railFetching=false; railFailAt=Date.now(); renderRailStatus();
 }
 function maybeFetchRails(la,lo){
+  if(ptLoaded && inPT(la,lo)) return;
   if(!railArea || hav(railArea,{la,lo}) > REFETCH_AFTER || !rails.size) fetchRails(la,lo);
 }
 
@@ -230,7 +242,7 @@ function advance(t){
   let dt=(t-F.t)/1000; if(dt<=0) return;
   if(t-F.fixT > DEAD_RECKON_MS){ F.t=t; return }
   let move = F.v*dt;
-  addMotion(move, dt*1000);
+  addMotion(move, dt*1000); F.odo += move;
   for(let k=0;k<4 && move>0;k++){
     const target = F.s + F.dir*move;
     if(target>=0 && target<=F.w.len){ F.s=target; move=0; break }
@@ -241,6 +253,23 @@ function advance(t){
   }
   F.t=t;
 }
+// Lecturas gruesas (±150 m o peor, típico de la red móvil dentro del vagón): cada una dice poco,
+// pero varias en 1 a 4 min marcan bien el avance. Se ajusta una recta (avance contra tiempo) ponderada.
+const OBS_WINDOW_MS = 240000;
+function addObs(t,o,acc){ F.obs.push({t,o,w:1/(acc*acc)}); while(F.obs.length && t-F.obs[0].t>OBS_WINDOW_MS) F.obs.shift() }
+function fitObs(){
+  const o=F.obs; if(o.length<4) return null;
+  const span=(o[o.length-1].t-o[0].t)/1000; if(span<40) return null;
+  const t0=o[0].t; let W=0,St=0,So=0,Stt=0,Sto=0;
+  for(const p of o){const x=(p.t-t0)/1000;W+=p.w;St+=p.w*x;So+=p.w*p.o;Stt+=p.w*x*x;Sto+=p.w*x*p.o}
+  const den=W*Stt-St*St; if(Math.abs(den)<1e-12) return null;
+  const b=(W*Sto-St*So)/den, a=(So-b*St)/W;
+  return {slope:b, span, at:t=>a+b*(t-t0)/1000};
+}
+// F.odo es el avance en el sentido de marcha; mover o invertir el sentido lo mantiene coherente
+function moveAlong(d){ const s0=F.s; F.s=Math.max(0,Math.min(F.w.len,F.s+F.dir*d)); F.odo+=F.dir*(F.s-s0) }
+function flipDir(){ F.dir*=-1; F.odo=-F.odo; for(const p of F.obs) p.o=-p.o }
+
 function filterUpdate(la,lo,t,acc,dopp){
   if(!ref) setRef(la,lo);
   if(!rails.size) return null;
@@ -248,33 +277,49 @@ function filterUpdate(la,lo,t,acc,dopp){
   const [mx,my] = toXY(la,lo);
   const recent = F && t-F.fixT < DEAD_RECKON_MS;
   if(recent) advance(t);
-  // con lectura muy mala y un estado reciente, solo se corrige un poco sobre la vía actual
-  if(recent && acc>250){
-    const c = snap(mx,my,Math.min(acc,1500),F.w.id);
-    if(c && c.w===F.w){ F.s += 0.03*(c.s-F.s) }
-    if(dopp!=null && acc<400) F.v = 0.7*F.v + 0.3*dopp;
+  if(recent && acc>150){
+    const c = snap(mx,my,Math.min(Math.max(acc*1.5,200),2000),F.w.id);
+    if(c){
+      const cur=atS(F.w,F.s), hx=cur.tx*F.dir, hy=cur.ty*F.dir;
+      addObs(t, F.odo + (c.x-cur.x)*hx + (c.y-cur.y)*hy, acc);
+      let fit = fitObs();
+      if(fit && fit.slope < -3 && fit.span>=60){ flipDir(); fit = fitObs() }
+      if(dopp!=null) F.v = 0.5*F.v + 0.5*dopp;
+      else if(fit) F.v = Math.max(0, Math.min(70, fit.slope));
+      const target = fit ? fit.at(t) : F.obs[F.obs.length-1].o;
+      moveAlong((fit?0.3:0.05)*(target - F.odo));
+    }
     F.fixT=t; F.acc=acc; return true;
   }
-  const c = snap(mx,my, Math.min(400, Math.max(60, acc*1.5)), recent?F.w.id:null);
+  const maxD = recent ? Math.min(400, Math.max(60, acc*1.5)) : Math.min(1500, Math.max(60, acc*1.5));
+  const c = snap(mx,my, maxD, recent?F.w.id:null);
   if(!c){ F=null; return null }
   if(!recent || c.w!==F.w){
-    // tramo nuevo: el sentido sale del rumbo que se traía o, si no, del rumbo del GPS
+    // tramo nuevo: el sentido sale del rumbo que se traía
     const tg = atS(c.w,c.s); let dir=1;
     if(recent && F.hx!=null) dir = (tg.tx*F.hx+tg.ty*F.hy)>=0 ? 1 : -1;
     const v = dopp!=null ? dopp : (recent?F.v:0);
-    F = {w:c.w, s:c.s, v, dir, t, fixT:t, lastMeasT:t, acc, hx:recent?F.hx:null, hy:recent?F.hy:null};
+    let odo=0, obs=[];
+    if(F){
+      const old=filteredPos(), [nla,nlo]=toLL(c.x,c.y), d=hav(old,{la:nla,lo:nlo});
+      if(recent){ odo=F.odo+d; obs=F.obs }
+      else { const dt=(t-F.fixT)/1000; if(d < 70*dt){ trip.dist+=d; if(d/dt>1) trip.movingMs+=t-F.fixT } }  // tramo sin señal: se suma en línea recta
+    }
+    F = {w:c.w, s:c.s, v, dir, t, fixT:t, lastMeasT:t, acc, odo, obs, hx:recent?F.hx:null, hy:recent?F.hy:null};
+    addObs(t, odo, acc);
     return true;
   }
   const dt = Math.max(0.5,(t-(F.lastMeasT||t))/1000);
   const innov = c.s - F.s;
   const alpha = Math.max(0.06, Math.min(0.8, 18/Math.max(acc,1)));
-  F.s = Math.max(0, Math.min(F.w.len, F.s + alpha*innov));
+  moveAlong(F.dir*alpha*innov);
   let vs = F.dir*F.v + (alpha*alpha/(2-alpha))*innov/dt;     // velocidad con signo, filtro alfa-beta
   if(dopp!=null){ const mag = 0.35*Math.abs(vs) + 0.65*dopp; vs = (Math.sign(vs)||F.dir)*mag }
-  if(Math.abs(vs)>1.5) F.dir = vs>0?1:-1;
+  if(Math.abs(vs)>1.5 && (vs>0?1:-1)!==F.dir) flipDir();
   F.v = Math.min(70, Math.abs(vs)); if(F.v<0.5) F.v=0;
   const tg = atS(F.w,F.s); F.hx=tg.tx*F.dir; F.hy=tg.ty*F.dir;
   F.fixT=t; F.lastMeasT=t; F.acc=acc;
+  addObs(t, F.odo, acc);
   return true;
 }
 function filteredPos(){ const p=atS(F.w,F.s); const [la,lo]=toLL(p.x,p.y); return {la,lo,hx:p.tx*F.dir,hy:p.ty*F.dir} }
@@ -282,7 +327,7 @@ function filteredPos(){ const p=atS(F.w,F.s); const [la,lo]=toLL(p.x,p.y); retur
 // --- Estado del viaje (por tren)
 let train = store.get('train','IC720');
 let trip, watchId = null, follow = true, lastGeocode = null, wakeLock = null;
-let centered = false, smooth = null, lastFix = null, mode = 'none';   // mode: 'rail' | 'raw' | 'none'
+let coarseRun = 0, centered = false, smooth = null, lastFix = null, mode = 'none';   // mode: 'rail' | 'raw' | 'none'
 const speedLog = [];
 
 function emptyTrip(){return {pts:[],dist:0,vmax:0,movingMs:0,start:null}}
@@ -315,6 +360,8 @@ function onPos(pos){
   const c = pos.coords, t = pos.timestamp || Date.now(), acc = Math.round(c.accuracy||9999);
   const dopp = (c.speed!=null && !isNaN(c.speed) && c.speed>=0 && acc<150) ? c.speed : null;
   lastFix = {la:c.latitude, lo:c.longitude, t, acc, c};
+  coarseRun = acc>=500 ? coarseRun+1 : 0;
+  $('tip').hidden = coarseRun < 4;
   rawDot.setLatLng([c.latitude,c.longitude]); accCircle.setLatLng([c.latitude,c.longitude]).setRadius(acc);
   if(!map.hasLayer(rawDot)){rawDot.addTo(map);accCircle.addTo(map)}
   if(!trip.start) trip.start = t;
@@ -366,10 +413,10 @@ setInterval(tick,1000);
 
 function renderRailStatus(){
   const el=$('railStatus');
-  if(railFetching){ el.className='status weak'; $('railText').textContent='Bajando vías…'; return }
+  if(railFetching && !ptLoaded){ el.className='status weak'; $('railText').textContent='Bajando vías…'; return }
   if(!rails.size){ el.className='status err'; $('railText').textContent = railError ? `Vías: ${railError}` : 'Vías: —'; return }
   if(mode==='rail'){ el.className='status ok'; $('railText').textContent = 'Sobre la vía' + (F&&F.w.name?` · ${F.w.name}`:''); return }
-  el.className='status weak'; $('railText').textContent = `Vías: ${rails.size} tramos`;
+  el.className='status weak'; $('railText').textContent = ptLoaded ? 'Vías de Portugal listas' : `Vías: ${rails.size} tramos`;
 }
 
 function render(){
